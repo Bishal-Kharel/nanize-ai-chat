@@ -1,0 +1,12 @@
+Flask==3.1.1
+Flask-SQLAlchemy==3.1.1
+Flask-JWT-Extended==4.7.1
+python-dotenv==1.1.0
+redis==6.2.0
+openai==1.100.2
+requests==2.32.4
+langchain==0.3.27
+langchain-openai==0.3.30
+langchain-chroma==0.2.5
+chromadb==1.0.20
+langchain-community==0.3.24
