@@ -252,7 +252,14 @@
     <template id="tpl-assistant">
       <div class="msg-row">
         <div class="msg msg-assistant">
-          <div class="msg-head"><div class="avatar ds">DS</div></div>
+          <div class="msg-head">
+            <div class="avatar ds">
+              <img
+                src="{{ url_for('static', filename='images/favicon.png') }}"
+                alt="Assistant Avatar"
+              />
+            </div>
+          </div>
           <div class="msg-body markdown"></div>
           <div class="msg-tools">
             <button class="icon-btn tool-copy" title="Copy">⧉</button>
