@@ -1,16 +1,37 @@
+// app.js
 /* ===== DOM utils ===== */
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
 
-const state = { threads: {}, activeId: null, mode: null, autoscroll: true };
+/* ===== global state ===== */
+const state = {
+  threads: {},
+  activeId: null,
+  mode: null,
+  autoscroll: true,
+  streaming: false,
+  _streamBlocks: null, // collect blocks during a stream
+};
 const LS_KEY = "ds_threads_v1";
 const SS_EXPANDED = "ds_session_expanded";
+const MAX_DOM_MESSAGES = 200;
+
+/* ===== runtime config ===== */
+const API_URL = window.APP_API_URL || "/api/ask";
+const APP_DEFAULTS = Object.assign(
+  { temperature: 0.7, top_p: 1.0 },
+  window.APP_DEFAULTS || {}
+);
 
 /* ===== storage ===== */
+let saveTimer = null;
 function save() {
-  try {
-    localStorage.setItem(LS_KEY, JSON.stringify(state.threads));
-  } catch {}
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    try {
+      localStorage.setItem(LS_KEY, JSON.stringify(state.threads));
+    } catch {}
+  }, 200);
 }
 function load() {
   try {
@@ -20,7 +41,16 @@ function load() {
   }
 }
 function uid() {
-  return Math.random().toString(36).slice(2, 10);
+  if (crypto?.randomUUID) return crypto.randomUUID().slice(0, 12);
+  try {
+    const a = new Uint32Array(2);
+    crypto.getRandomValues(a);
+    return Array.from(a, (x) => x.toString(36))
+      .join("")
+      .slice(0, 12);
+  } catch {
+    return Math.random().toString(36).slice(2, 14);
+  }
 }
 function nowISO() {
   return new Date().toISOString();
@@ -43,23 +73,162 @@ function threadSortKey(t) {
   return (t && (t.updatedAt || t.createdAt)) || "";
 }
 
-/* ===== markdown mini-renderer ===== */
+/* ===== markdown (safe) ===== */
 function mdToHtml(md) {
-  const esc = String(md || "")
+  const src = String(md || "");
+  let esc = src
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
-  return esc
-    .replace(/^### (.*$)/gim, "<h3>$1</h3>")
-    .replace(/^## (.*$)/gim, "<h2>$1</h2>")
-    .replace(/^# (.*$)/gim, "<h1>$1</h1>")
-    .replace(/\*\*(.*?)\*\*/gim, "<b>$1</b>")
-    .replace(/^- (.*)$/gim, "<ul><li>$1</li></ul>")
-    .replace(/\n{2,}/g, "\n\n")
+  const codeBlocks = [];
+  esc = esc.replace(/```([\s\S]*?)```/g, (_, code) => {
+    const i = codeBlocks.push(code) - 1;
+    return `\uE000CODEBLOCK${i}\uE000`;
+  });
+  esc = esc
+    .replace(/^### (.*)$/gim, "<h3>$1</h3>")
+    .replace(/^## (.*)$/gim, "<h2>$1</h2>")
+    .replace(/^# (.*)$/gim, "<h1>$1</h1>");
+  // bullet lists
+  esc = esc.replace(/(?:^|\n)(- .*(?:\n- .*)+)(?=\n|$)/g, (block) => {
+    const items = block
+      .trim()
+      .split("\n")
+      .map((l) => l.replace(/^- /, "").trim());
+    return `<ul>${items.map((i) => `<li>${i}</li>`).join("")}</ul>`;
+  });
+  // emphasis, inline code, links
+  esc = esc
+    .replace(/\*\*(.*?)\*\*/g, "<b>$1</b>")
+    .replace(/\*(.*?)\*/g, "<i>$1</i>")
+    .replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(
+      /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
+      `<a href="$2" target="_blank" rel="nofollow noopener">$1</a>`
+    );
+  // pipe tables
+  esc = esc.replace(/(?:^|\n)((?:\|.*\|\r?\n)+)(?:\r?\n|$)/g, (block) => {
+    const lines = block
+      .trim()
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter(Boolean);
+    if (lines.length < 2) return block;
+    const header = lines[0],
+      sep = lines[1];
+    if (!/^\|?(\s*:?-{3,}:?\s*\|)+\s*$/.test(sep)) return block;
+    const cells = (line) =>
+      line
+        .replace(/^\|/, "")
+        .replace(/\|$/, "")
+        .split("|")
+        .map((c) => c.trim());
+    const thead = cells(header);
+    const rows = lines.slice(2).map(cells);
+    const ths = thead.map((h) => `<th>${h}</th>`).join("");
+    const trs = rows
+      .map((r) => `<tr>${r.map((v) => `<td>${v || ""}</td>`).join("")}</tr>`)
+      .join("");
+    return `<table class="ai-table"><thead><tr>${ths}</tr></thead><tbody>${trs}</tbody></table>`;
+  });
+  // paragraphs
+  esc = esc
+    .replace(/\n{2,}/g, "</p><p>")
+    .replace(/^/, "<p>")
+    .replace(/$/, "</p>")
     .replace(/\n/g, "<br/>");
+  // restore fenced code
+  esc = esc.replace(/\uE000CODEBLOCK(\d+)\uE000/g, (_, n) => {
+    const code = (codeBlocks[Number(n)] || "")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
+    return `<pre><code>${code}</code></pre>`;
+  });
+  return esc;
 }
 
-/* ===== dynamic script loaders ===== */
+/* ===== AI narrative guard: strip leaked HTML (table-ish) ===== */
+function stripAiHtml(s) {
+  if (!s) return s;
+  s = s.replace(/<style[\s\S]*?<\/style>/gi, "");
+  s = s.replace(/<div[^>]*class=["']?nx-compare[^>]*>[\s\S]*?<\/div>/gi, "");
+  s = s.replace(/<table[\s\S]*?<\/table>/gi, "");
+  s = s.replace(/<div[^>]*role=["']table["'][\s\S]*?<\/div>/gi, "");
+  s = s.replace(
+    /<div[^>]*role=["'](?:rowgroup|row|cell|columnheader|rowheader)["'][^>]*>[\s\S]*?<\/div>/gi,
+    ""
+  );
+  s = s.replace(/<(iframe|script)[\s\S]*?<\/\1>/gi, "");
+  return s;
+}
+
+/* ===== simple HTML sanitizer for tool-rendered HTML ===== */
+function sanitizeHtml(html) {
+  const allowedTags = new Set([
+    "STYLE",
+    "DIV",
+    "SPAN",
+    "P",
+    "B",
+    "I",
+    "UL",
+    "LI",
+    "CODE",
+    "PRE",
+    "H1",
+    "H2",
+    "H3",
+    "TABLE",
+    "THEAD",
+    "TBODY",
+    "TR",
+    "TH",
+    "TD",
+    "FIGURE",
+    "IMG",
+    "FIGCAPTION",
+    "A",
+  ]);
+  const allowedAttrs = new Set([
+    "class",
+    "role",
+    "style",
+    "href",
+    "target",
+    "rel",
+    "src",
+    "alt",
+    "aria-label",
+    "aria-live",
+    "aria-role",
+  ]);
+  const tmp = document.createElement("div");
+  tmp.innerHTML = html || "";
+  const walker = document.createTreeWalker(tmp, NodeFilter.SHOW_ELEMENT, null);
+  const toRemove = [];
+  while (walker.nextNode()) {
+    const el = walker.currentNode;
+    if (!allowedTags.has(el.tagName)) {
+      toRemove.push(el);
+      continue;
+    }
+    [...el.attributes].forEach((a) => {
+      const n = a.name.toLowerCase();
+      if (!allowedAttrs.has(a.name)) el.removeAttribute(a.name);
+      if (
+        (n === "href" || n === "src") &&
+        /^(javascript:|data:)/i.test(a.value || "")
+      )
+        el.removeAttribute(a.name);
+    });
+  }
+  toRemove.forEach((n) =>
+    n.replaceWith(document.createTextNode(n.textContent || ""))
+  );
+  return tmp.innerHTML;
+}
+
+/* ===== dynamic libs ===== */
 const libCache = {};
 function loadScript(src) {
   if (libCache[src]) return libCache[src];
@@ -72,10 +241,6 @@ function loadScript(src) {
     document.head.appendChild(s);
   });
   return libCache[src];
-}
-async function ensurePlotly() {
-  if (window.Plotly) return;
-  await loadScript("https://cdn.plot.ly/plotly-latest.min.js");
 }
 async function ensureVegaLite() {
   if (window.vegaEmbed) return;
@@ -101,29 +266,10 @@ async function ensureLottie() {
   );
 }
 
-/* ===== Hero background visibility + selection ===== */
+/* ===== layout ===== */
 function showHeroBg(show) {
-  const el = $("#heroBg");
-  if (!el) return;
-  el.style.display = show ? "block" : "none";
-  if (show) pickHeroVideo();
+  $("#heroBg") && ($("#heroBg").style.display = show ? "block" : "none");
 }
-function pickHeroVideo() {
-  const land = $("#bgLandscape"),
-    p1 = $("#bgPortrait1"),
-    p2 = $("#bgPortrait2");
-  if (!land || !p1 || !p2) return;
-  const isSmall = window.matchMedia("(max-width: 980px)").matches;
-  const isPortrait = window.matchMedia("(orientation: portrait)").matches;
-  if (!isSmall) {
-    [land, p1, p2].forEach((el) => (el.style.display = "block"));
-    return;
-  }
-  [land, p1, p2].forEach((el) => (el.style.display = "none"));
-  (isPortrait ? (Math.random() < 0.5 ? p1 : p2) : land).style.display = "block";
-}
-
-/* ===== layout + scrolling ===== */
 function updateComposerHeightVar() {
   const el = $("#composer");
   const h = el ? el.offsetHeight : 120;
@@ -133,13 +279,14 @@ function updateComposerHeightVar() {
 function layoutMessages() {
   const msgs = $("#messages");
   if (!msgs) return;
-  const composerH = $("#composer")?.offsetHeight || 120;
+  const composer = $("#composer");
+  const ch = composer ? composer.offsetHeight : 120;
   const rect = msgs.getBoundingClientRect();
-  const available = Math.max(
+  const avail = Math.max(
     220,
-    Math.floor(window.innerHeight - composerH - 24 - rect.top)
+    Math.floor(window.innerHeight - ch - 24 - rect.top)
   );
-  msgs.style.height = available + "px";
+  msgs.style.height = avail + "px";
 }
 function isNearBottom(el, px = 80) {
   return el.scrollHeight - (el.scrollTop + el.clientHeight) <= px;
@@ -148,8 +295,6 @@ function scrollBottom() {
   const c = $("#messages");
   if (c) c.scrollTop = c.scrollHeight;
 }
-
-/* anchor composer to MAIN center */
 function positionComposer() {
   const main = $("#main");
   if (!main) return;
@@ -160,7 +305,7 @@ function positionComposer() {
   );
 }
 
-/* ===== high-level UI helpers ===== */
+/* ===== UI helpers ===== */
 function setHeroVisible(v) {
   $("#hero")?.classList.toggle("hidden", !v);
   $("#chat")?.classList.toggle("hidden", v);
@@ -172,7 +317,7 @@ function setHeroVisible(v) {
 function setSendEnabled() {
   const i = $("#composerInput"),
     b = $("#sendBtn");
-  if (i && b) b.disabled = !i.value.trim();
+  if (i && b) b.disabled = state.streaming || !i.value.trim();
 }
 function setActivePill(btn) {
   $$(".pill").forEach((b) => b.classList.remove("active"));
@@ -194,7 +339,7 @@ function setSidebarOpen(open) {
   positionComposer();
 }
 
-/* ===== sidebar + history ===== */
+/* ===== history ===== */
 function renderSidebar() {
   const all = Object.values(state.threads).sort((a, b) =>
     threadSortKey(b).localeCompare(threadSortKey(a))
@@ -205,18 +350,16 @@ function renderSidebar() {
   todayList.innerHTML = "";
   yList.innerHTML = "";
   const today = new Date().toDateString();
-
   for (const t of all) {
     const created = t.createdAt || t.updatedAt || "";
     const d = created ? new Date(created).toDateString() : "Unknown";
     const li = document.createElement("li");
-    li.innerHTML = `
-      <div class="thread-item" data-id="${t.id}">
-        <span class="title">${t.title || "Untitled"}</span>
-        <button class="del" title="Delete">🗑</button>
-      </div>`;
+    li.innerHTML = `<div class="thread-item" data-id="${
+      t.id
+    }"><span class="title">${
+      t.title || "Untitled"
+    }</span><button class="del" title="Delete">🗑</button></div>`;
     (d === today ? todayList : yList).appendChild(li);
-
     const row = $(".thread-item", li);
     if (t.id === state.activeId) row.classList.add("active");
     row.addEventListener("click", (e) => {
@@ -228,14 +371,13 @@ function renderSidebar() {
       deleteThread(t.id);
     });
   }
-  if ($("#sidebarScroll")) $("#sidebarScroll").scrollTop = 0;
+  $("#sidebarScroll") && ($("#sidebarScroll").scrollTop = 0);
 }
 function deleteThread(id) {
   const ids = Object.keys(state.threads);
   const idx = ids.indexOf(id);
   delete state.threads[id];
   save();
-
   if (state.activeId === id) {
     const nextId = ids[idx + 1] || ids[idx - 1];
     if (nextId && state.threads[nextId]) {
@@ -284,7 +426,7 @@ function activateThread(id, renderMessages = false) {
   }, 20);
 }
 
-/* ===== block renderers ===== */
+/* ===== renderers ===== */
 function createAssistantNode() {
   const tpl = $("#tpl-assistant");
   const node = tpl?.content?.firstElementChild
@@ -293,6 +435,8 @@ function createAssistantNode() {
         className: "msg assistant",
       });
   const body = $(".msg-body", node) || node;
+  body.setAttribute("role", "status");
+  body.setAttribute("aria-live", "polite");
   return { node, body };
 }
 function createUserNode(text) {
@@ -308,21 +452,38 @@ function renderMarkdown(body, md) {
   body.innerHTML = mdToHtml(md || "");
 }
 
-async function renderPlotly(container, spec) {
-  await ensurePlotly();
-  const div = document.createElement("div");
-  div.className = "block chart plotly";
-  container.appendChild(div);
-  const { data, layout, config, frames } = spec || {};
-  await window.Plotly.newPlot(div, data || [], layout || {}, config || {});
-  if (frames) window.Plotly.addFrames(div, frames);
+/* ===== dynamic compaction ===== */
+function compactBlocks(container) {
+  if (!container) return;
+  const blocks = Array.from(container.querySelectorAll(".block"));
+  for (let i = 0; i < blocks.length; i++) {
+    const cur = blocks[i],
+      nxt = blocks[i + 1];
+    if (!cur) continue;
+    cur.style.margin = "0"; // margins disabled; flex gap handles rhythm
+    if (cur.classList.contains("html") && nxt?.classList.contains("animation"))
+      nxt.style.margin = "0";
+  }
 }
+
+/* charts / diagrams / media helpers */
 async function renderVegaLite(container, spec) {
   await ensureVegaLite();
   const div = document.createElement("div");
   div.className = "block chart vega";
   container.appendChild(div);
-  await window.vegaEmbed(div, spec || {}, { actions: false });
+  await window.vegaEmbed(
+    div,
+    Object.assign({ width: "container" }, spec || {}),
+    { actions: false }
+  );
+  // embed outputs an inline SVG → kill baseline gap
+  const svg = div.querySelector("svg");
+  if (svg) {
+    svg.style.display = "block";
+    svg.style.verticalAlign = "top";
+  }
+  compactBlocks(container);
 }
 async function renderMermaid(container, code) {
   await ensureMermaid();
@@ -335,25 +496,47 @@ async function renderMermaid(container, code) {
       code || "flowchart LR; A-->B;"
     );
     div.innerHTML = svg;
+    const s = div.querySelector("svg");
+    if (s) {
+      s.style.display = "block";
+      s.style.verticalAlign = "top";
+    }
   } catch {
     div.textContent = "Diagram render error";
   }
+  compactBlocks(container);
 }
-async function renderLottie(container, json) {
+async function renderLottie(container, json, data = {}, controls = {}) {
   await ensureLottie();
   const div = document.createElement("div");
   div.className = "block animation lottie";
   div.style.width = "100%";
-  div.style.maxWidth = "640px";
-  div.style.minHeight = "160px";
+  div.style.maxWidth = "480px";
+  div.style.minHeight = "0";
+  div.style.margin = "0";
+  div.style.overflow = "hidden";
   container.appendChild(div);
-  window.lottie.loadAnimation({
+
+  const anim = window.lottie.loadAnimation({
     container: div,
     renderer: "svg",
-    loop: true,
-    autoplay: true,
+    loop: controls.loop !== false,
+    autoplay: controls.autoplay !== false,
     animationData: json || {},
   });
+  anim.setSpeed(Number(controls.speed || 1));
+
+  anim.addEventListener("DOMLoaded", () => {
+    const svg = div.querySelector("svg");
+    if (svg) {
+      svg.style.display = "block";
+      svg.style.verticalAlign = "top";
+    }
+    const h = svg ? Math.ceil(svg.getBoundingClientRect().height || 36) : 36;
+    div.style.height = Math.max(28, Math.min(56, h)) + "px";
+    compactBlocks(container);
+  });
+  return anim;
 }
 function renderImage(container, url, alt) {
   const fig = document.createElement("figure");
@@ -370,6 +553,7 @@ function renderImage(container, url, alt) {
     fig.appendChild(cap);
   }
   container.appendChild(fig);
+  compactBlocks(container);
 }
 function renderTable(container, columns, rows) {
   const wrap = document.createElement("div");
@@ -398,7 +582,50 @@ function renderTable(container, columns, rows) {
   table.appendChild(tbody);
   wrap.appendChild(table);
   container.appendChild(wrap);
+  compactBlocks(container);
 }
+
+/* ===== blocks persistence helpers ===== */
+function toolToBlock(tool) {
+  const { name, args = {} } = tool || {};
+  if (!name) return null;
+  if (name === "render_table")
+    return {
+      type: "table",
+      columns: args.columns || [],
+      rows: args.rows || [],
+      caption: args.caption,
+    };
+  if (name === "render_chart")
+    return {
+      type: "chart",
+      lib: "vega-lite",
+      spec: args.vegalite_spec,
+      title: args.title,
+    };
+  if (name === "render_mermaid")
+    return { type: "diagram", lib: "mermaid", code: args.code };
+  if (name === "render_image")
+    return { type: "image", url: args.url, alt: args.alt };
+  if (name === "render_html")
+    return {
+      type: "html",
+      html: sanitizeHtml(args.html || ""),
+      data: args.data,
+    };
+  if (name === "render_lottie")
+    return {
+      type: "animation",
+      lib: "lottie",
+      json: args.json,
+      data: args.data,
+      controls: args.controls,
+      title: args.title,
+    };
+  return { type: "unknown", raw: tool };
+}
+
+/* ===== render blocks ===== */
 async function renderBlocksInto(body, blocks) {
   body.innerHTML = "";
   const container = document.createElement("div");
@@ -411,32 +638,55 @@ async function renderBlocksInto(body, blocks) {
       div.className = "block text";
       div.innerHTML = mdToHtml(blk.content || "");
       container.appendChild(div);
-    } else if (t === "chart" && blk.lib === "plotly") {
-      await renderPlotly(container, blk.spec);
     } else if (t === "chart" && blk.lib === "vega-lite") {
       await renderVegaLite(container, blk.spec);
+      if (blk.title) {
+        const cap = document.createElement("div");
+        cap.className = "block caption";
+        cap.innerHTML = mdToHtml(`**${blk.title}**`);
+        container.appendChild(cap);
+      }
     } else if (t === "diagram" && blk.lib === "mermaid") {
       await renderMermaid(container, blk.code);
     } else if (t === "animation" && blk.lib === "lottie") {
-      await renderLottie(container, blk.json);
+      await renderLottie(container, blk.json, blk.data, blk.controls);
+      // no caption to avoid extra space
     } else if (t === "image") {
       renderImage(container, blk.url, blk.alt);
     } else if (t === "table") {
       renderTable(container, blk.columns || [], blk.rows || []);
+      if (blk.caption) {
+        const cap = document.createElement("div");
+        cap.className = "block caption";
+        cap.innerHTML = mdToHtml(`**${blk.caption}**`);
+        container.appendChild(cap);
+      }
+    } else if (t === "html") {
+      const card = document.createElement("div");
+      card.className = "block html";
+      card.innerHTML = sanitizeHtml(blk.html || "");
+      container.appendChild(card);
     } else {
       const pre = document.createElement("pre");
       pre.textContent = JSON.stringify(blk, null, 2);
       container.appendChild(pre);
     }
   }
+  compactBlocks(container);
 }
 
 /* ===== messages ===== */
+function titleFrom(text) {
+  const t = (text || "").replace(/\s+/g, " ").trim();
+  if (!t) return "New chat";
+  const words = t.split(" ");
+  const short = words.slice(0, 12).join(" ");
+  return short.length < t.length ? short + "…" : short;
+}
 function appendMessage(role, content, push = true, kind) {
   kind = kind || (content && content.blocks ? "blocks" : "text");
   const list = $("#messages");
   if (!list) return { node: null, body: null };
-
   let node, body;
   if (role === "assistant") {
     ({ node, body } = createAssistantNode());
@@ -449,8 +699,9 @@ function appendMessage(role, content, push = true, kind) {
     ));
   }
   list.appendChild(node);
+  while (list.children.length > MAX_DOM_MESSAGES)
+    list.removeChild(list.firstChild);
   hookMessageTools(node, role, body, kind);
-
   if (push) {
     const th = state.threads[state.activeId];
     th.messages.push({ role, content, kind });
@@ -473,63 +724,6 @@ function hookMessageTools(node, role, body) {
         toast("Copy failed");
       }
     };
-  const retry = $(".tool-retry", node);
-  if (retry)
-    retry.onclick = () => {
-      const th = state.threads[state.activeId];
-      const lastUser = [...th.messages]
-        .reverse()
-        .find((m) => m.role === "user");
-      if (lastUser) sendPrompt(lastUser.content, true);
-    };
-  const up = $(".tool-up", node),
-    down = $(".tool-down", node);
-  if (up)
-    up.onclick = () => {
-      up.classList.toggle("active");
-      down?.classList.remove("active");
-    };
-  if (down)
-    down.onclick = () => {
-      down.classList.toggle("active");
-      up?.classList.remove("active");
-    };
-  const edit = $(".tool-edit", node);
-  if (edit)
-    edit.onclick = () => {
-      const curr = role === "assistant" ? body.innerText : body.textContent;
-      const ci = $("#composerInput");
-      if (ci) {
-        ci.value = curr || "";
-        ci.focus();
-      }
-      node.remove();
-      const th = state.threads[state.activeId];
-      const idx = th.messages.findIndex(
-        (m) =>
-          m.role === "user" &&
-          (m.content === curr || m.content?.content === curr)
-      );
-      if (idx > -1) {
-        th.messages.splice(idx, 1);
-        save();
-      }
-      setSendEnabled();
-    };
-}
-
-/* ===== first-send expansion ===== */
-function exitCompactOnce() {
-  if (sessionStorage.getItem(SS_EXPANDED) === "1") return;
-  setHeroVisible(false);
-  setSidebarOpen(true);
-  activateThread(state.activeId, true);
-  requestAnimationFrame(() => {
-    document.body.classList.remove("compact");
-  });
-  sessionStorage.setItem(SS_EXPANDED, "1");
-  updateComposerHeightVar();
-  positionComposer();
 }
 
 /* ===== toast ===== */
@@ -547,8 +741,8 @@ function toast(msg) {
   toastTimer = setTimeout(() => t.classList.remove("show"), 1500);
 }
 
-/* ===== backend SSE (named events) ===== */
-async function* sseStream(url, body) {
+/* ===== SSE ===== */
+async function* sseStream(url, body, signal) {
   const res = await fetch(url, {
     method: "POST",
     headers: {
@@ -556,17 +750,16 @@ async function* sseStream(url, body) {
       Accept: "text/event-stream",
     },
     body: JSON.stringify(body || {}),
+    signal,
   });
   if (!res.ok || !res.body) throw new Error("Request failed");
   const reader = res.body.getReader();
   const dec = new TextDecoder();
   let buf = "";
-
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
     buf += dec.decode(value, { stream: true });
-
     let idx;
     while ((idx = buf.indexOf("\n\n")) !== -1) {
       const raw = buf.slice(0, idx);
@@ -594,13 +787,14 @@ async function* sseStream(url, body) {
 async function handleTool(tool, bodyEl) {
   const { name, args } = tool || {};
   if (!name || !bodyEl) return;
-
   let container = bodyEl.querySelector(".ai-blocks");
   if (!container) {
     container = document.createElement("div");
     container.className = "ai-blocks";
     bodyEl.appendChild(container);
   }
+
+  const hasLinksCard = !!bodyEl.querySelector(".block.html"); // optional pairing for Lottie
 
   if (name === "render_table") {
     renderTable(container, args?.columns || [], args?.rows || []);
@@ -610,51 +804,66 @@ async function handleTool(tool, bodyEl) {
       cap.innerHTML = mdToHtml(`**${args.caption}**`);
       container.appendChild(cap);
     }
-    return;
-  }
-  if (name === "render_chart") {
-    await renderVegaLite(
-      container,
-      Object.assign({ width: "container" }, args?.vegalite_spec || {})
+  } else if (name === "render_chart") {
+    await ensureVegaLite();
+    const div = document.createElement("div");
+    div.className = "block chart vega";
+    container.appendChild(div);
+    await window.vegaEmbed(
+      div,
+      Object.assign({ width: "container" }, args?.vegalite_spec || {}),
+      { actions: false }
     );
-    if (args?.title) {
-      const cap = document.createElement("div");
-      cap.className = "block caption";
-      cap.innerHTML = mdToHtml(`**${args.title}**`);
-      container.appendChild(cap);
+    const svg = div.querySelector("svg");
+    if (svg) {
+      svg.style.display = "block";
+      svg.style.verticalAlign = "top";
     }
-    return;
-  }
-  if (name === "render_mermaid") {
+  } else if (name === "render_mermaid") {
     await renderMermaid(container, args?.code || "flowchart LR; A-->B;");
-    return;
-  }
-  if (name === "render_image") {
+  } else if (name === "render_image") {
     renderImage(container, args?.url || "", args?.alt || "");
-    return;
-  }
-  if (name === "render_html") {
+  } else if (name === "render_html") {
     const card = document.createElement("div");
     card.className = "block html";
-    card.innerHTML = args?.html || "";
+    card.innerHTML = sanitizeHtml(args?.html || "");
     container.appendChild(card);
-    return;
+  } else if (name === "render_lottie") {
+    if (!hasLinksCard) return; // optional guard
+    await renderLottie(
+      container,
+      args?.json || {},
+      args?.data || {},
+      args?.controls || {}
+    );
+  } else {
+    const pre = document.createElement("pre");
+    pre.textContent = JSON.stringify(tool, null, 2);
+    container.appendChild(pre);
   }
 
-  const pre = document.createElement("pre");
-  pre.textContent = JSON.stringify(tool, null, 2);
-  container.appendChild(pre);
+  compactBlocks(container);
+
+  const blk = toolToBlock(tool);
+  if (blk && state._streamBlocks) state._streamBlocks.push(blk);
 }
 
 /* ===== send ===== */
 async function sendPrompt(text) {
-  if (!state.threads[state.activeId]) newThread();
+  if (state.streaming) {
+    toast("Busy");
+    return;
+  }
   exitCompactOnce();
+  if (!state.threads[state.activeId]) newThread();
 
   if (state.threads[state.activeId].messages.length === 0) {
+    const pretty = titleFrom(text);
     const chip = $("#threadTitleChip");
-    if (chip) chip.textContent = "Greeting and Offer of Assistance";
-    state.threads[state.activeId].title = "Greeting and Offer of Assistance";
+    if (chip) chip.textContent = pretty;
+    state.threads[state.activeId].title = pretty;
+    save();
+    renderSidebar();
   }
 
   appendMessage("user", text, true, "text");
@@ -663,6 +872,8 @@ async function sendPrompt(text) {
     ci.value = "";
     ci.style.height = "28px";
   }
+  state.streaming = true;
+  state._streamBlocks = [];
   setSendEnabled();
   updateComposerHeightVar();
 
@@ -672,16 +883,47 @@ async function sendPrompt(text) {
 
   let acc = "";
   let usedBlocks = false;
+  let gotFinalBlocks = null;
+  const renderBuf = [];
+  let frameScheduled = false;
 
-  try {
+  function scheduleRender() {
     const container = $("#messages");
-    for await (const evt of sseStream("/api/ask", { prompt: text })) {
-      if (evt.event === "token" && typeof evt.data?.text === "string") {
-        if (!acc) body.innerHTML = "";
-        acc += evt.data.text;
-        body.innerHTML = mdToHtml(acc);
+    if (!frameScheduled) {
+      frameScheduled = true;
+      requestAnimationFrame(() => {
+        frameScheduled = false;
+        if (!renderBuf.length) return;
+        acc += renderBuf.join("");
+        renderBuf.length = 0;
+        body.innerHTML = mdToHtml(stripAiHtml(acc));
+        if (container) state.autoscroll = isNearBottom(container);
         if (state.autoscroll && container)
           container.scrollTop = container.scrollHeight;
+      });
+    }
+  }
+
+  const container = $("#messages");
+  const ctrl = new AbortController();
+
+  try {
+    for await (const evt of sseStream(
+      API_URL,
+      {
+        prompt: text,
+        temperature: APP_DEFAULTS.temperature,
+        top_p: APP_DEFAULTS.top_p,
+      },
+      ctrl.signal
+    )) {
+      if (evt.event === "token" && typeof evt.data?.text === "string") {
+        const t = evt.data.text || "";
+        if (/<style|<table|role=["']table["']|class=["']?nx-compare/i.test(t))
+          continue;
+        if (!acc) body.innerHTML = "";
+        renderBuf.push(t);
+        scheduleRender();
         continue;
       }
       if (evt.event === "tool" && evt.data?.name) {
@@ -691,43 +933,89 @@ async function sendPrompt(text) {
           container.scrollTop = container.scrollHeight;
         continue;
       }
-      if (evt.event === "final" && typeof evt.data?.text === "string") {
-        acc = evt.data.text;
-        body.innerHTML = mdToHtml(acc);
+      if (evt.event === "final") {
+        const hasBlocks = Array.isArray(evt.data?.blocks);
+        if (hasBlocks) {
+          usedBlocks = true;
+          gotFinalBlocks = evt.data.blocks;
+          await renderBlocksInto(body, gotFinalBlocks);
+          if (state.autoscroll && container)
+            container.scrollTop = container.scrollHeight;
+        } else if (typeof evt.data?.text === "string") {
+          if (renderBuf.length) {
+            acc += renderBuf.join("");
+            renderBuf.length = 0;
+          }
+          acc = stripAiHtml(evt.data.text);
+          body.innerHTML = mdToHtml(acc);
+          if (state.autoscroll && container)
+            container.scrollTop = container.scrollHeight;
+        }
+        continue;
+      }
+      if (evt.event === "message" && Array.isArray(evt.data?.blocks)) {
+        usedBlocks = true;
+        gotFinalBlocks = evt.data.blocks;
+        await renderBlocksInto(body, gotFinalBlocks);
+        if (state.autoscroll && container)
+          container.scrollTop = container.scrollHeight;
         continue;
       }
       if (evt.event === "done") break;
-
-      // Legacy fallback: treat as token
       if (evt.data?.text) {
         if (!acc) body.innerHTML = "";
-        acc += evt.data.text;
-        body.innerHTML = mdToHtml(acc);
-        if (state.autoscroll && container)
-          container.scrollTop = container.scrollHeight;
+        renderBuf.push(evt.data.text);
+        scheduleRender();
       }
     }
   } catch {
     acc = acc || "_Error: failed to get response._";
     if (body) body.innerHTML = mdToHtml(acc);
   } finally {
+    ctrl.abort();
     const th = state.threads[state.activeId];
-    if (usedBlocks && body?.querySelector(".ai-blocks")) {
+    if (usedBlocks || (gotFinalBlocks && gotFinalBlocks.length)) {
       const blocks = [];
       if (acc) blocks.push({ type: "text", content: acc });
+      if (state._streamBlocks && state._streamBlocks.length)
+        blocks.push(...state._streamBlocks);
+      if (gotFinalBlocks && gotFinalBlocks.length)
+        blocks.push(...gotFinalBlocks);
       th.messages.push({
         role: "assistant",
         content: { blocks },
         kind: "blocks",
       });
     } else {
+      if (renderBuf.length) {
+        acc += renderBuf.join("");
+        renderBuf.length = 0;
+      }
       th.messages.push({ role: "assistant", content: acc, kind: "text" });
     }
+    state._streamBlocks = null;
     th.updatedAt = nowISO();
     save();
     renderSidebar();
     scrollBottom();
+    state.streaming = false;
+    setSendEnabled();
   }
+}
+
+/* ===== first-send expansion ===== */
+function exitCompactOnce() {
+  if (sessionStorage.getItem(SS_EXPANDED) === "1") return;
+  newThread();
+  setHeroVisible(false);
+  setSidebarOpen(true);
+  activateThread(state.activeId, true);
+  requestAnimationFrame(() => {
+    document.body.classList.remove("compact");
+  });
+  sessionStorage.setItem(SS_EXPANDED, "1");
+  updateComposerHeightVar();
+  positionComposer();
 }
 
 /* ===== events ===== */
@@ -749,22 +1037,6 @@ $("#sendBtn")?.addEventListener("click", () => {
   if (!text) return;
   sendPrompt(text);
 });
-$("#fileInput")?.addEventListener("change", (e) => {
-  const f = e.target?.files && e.target.files[0];
-  if (f) toast(`Attached: ${f.name}`);
-});
-$("#deepthinkBtn")?.addEventListener("click", (e) =>
-  setActivePill(
-    e.currentTarget.classList.contains("active") ? null : e.currentTarget
-  )
-);
-$("#searchBtn")?.addEventListener("click", (e) =>
-  setActivePill(
-    e.currentTarget.classList.contains("active") ? null : e.currentTarget
-  )
-);
-
-/* sidebar controls */
 $("#sidebarCloseBtn")?.addEventListener("click", () => setSidebarOpen(false));
 $("#sidebarOpenBtn")?.addEventListener("click", () => setSidebarOpen(true));
 $("#sidebarOpenFloat")?.addEventListener("click", () => setSidebarOpen(true));
@@ -777,9 +1049,24 @@ $("#newChatBtn")?.addEventListener("click", () => {
 /* ===== init ===== */
 (function init() {
   load();
-  migrateThreads(); // ensure required fields exist
-  if (Object.keys(state.threads).length === 0) newThread();
-  else state.activeId = Object.keys(state.threads)[0];
+  migrateThreads();
+
+  // spacing + baseline-gap fixes + table theme
+  const style = document.createElement("style");
+  style.textContent = `
+    .ai-blocks{display:flex;flex-direction:column;row-gap:6px}
+    .ai-blocks .block{margin:0}
+    .ai-blocks .block.animation.lottie{line-height:0;overflow:hidden}
+    .ai-blocks .block.animation.lottie svg{display:block;height:auto;vertical-align:top}
+    .chart.vega svg, .diagram.mermaid svg{display:block;vertical-align:top}
+    .ai-blocks .block p{margin:6px 0}
+    .ai-table{border-collapse:separate;border:1px solid #e6edf7;border-radius:10px;overflow:hidden}
+    .ai-table thead th{background:#f6f9ff;text-align:left}
+  `;
+  document.head.appendChild(style);
+
+  const ids = Object.keys(state.threads);
+  state.activeId = ids.length ? ids[0] : null;
 
   sessionStorage.removeItem(SS_EXPANDED);
   document.body.classList.add("compact");
@@ -789,24 +1076,20 @@ $("#newChatBtn")?.addEventListener("click", () => {
   updateComposerHeightVar();
   positionComposer();
 
-  pickHeroVideo();
   window.addEventListener("resize", () => {
-    if (!$("#hero")?.classList.contains("hidden")) pickHeroVideo();
     updateComposerHeightVar();
     positionComposer();
   });
-
   const composerEl = $("#composer");
   if (composerEl)
     new ResizeObserver(() => {
       updateComposerHeightVar();
       positionComposer();
     }).observe(composerEl);
-
   const msgs = $("#messages");
   msgs?.addEventListener("scroll", () => {
+    if (!msgs) return;
     state.autoscroll = isNearBottom(msgs);
   });
-
   setSendEnabled();
 })();
