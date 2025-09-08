@@ -7,10 +7,10 @@ import os
 load_dotenv()
 
 # Import Nanize blueprint
-from ai_routes import nanize_bp
+from ai_routes import ai_bp
 
 app = Flask(__name__)
-app.register_blueprint(nanize_bp)
+app.register_blueprint(ai_bp)
 
 @app.route("/")
 def index():
