@@ -3,7 +3,7 @@
 **Nanize** is a **web-based chat platform** designed for **real-time AI interaction** with a **modern UI** and **streamed responses**.  
 It provides a **threaded chat interface**, **rich outputs** (charts, diagrams, tables, images, animations), and integrates with **Flask**, **OpenAI**, **Chroma**, and **Redis** for **fast, contextual answers**.
 
-Hosted at: [GitHub Repository](https://github.com/yourusername/nanize-chat)
+Hosted at: [Medical Platform](https://www.themedicaltechnology.com/nanize-chat-assistant)
 
 Nanize allows users to **ask questions**, receive **AI-generated responses** streamed via **Server-Sent Events (SSE)**, and view **rich media content** inline.  
 It is built for **speed**, **clarity**, and **scalability**, making it a great foundation for **assistants**, **knowledge bases**, or **educational tools**.
@@ -61,6 +61,6 @@ It is built for **speed**, **clarity**, and **scalability**, making it a great f
 ### **1. Clone the Repository**
 
 ```bash
-git clone https://github.com/yourusername/nanize-chat.git
-cd nanize-chat
+git clone https://github.com/Bishal-Kharel/nanize-ai-chat.git
+cd nanize-ai-chat
 ```
